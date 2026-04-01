@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import json
-import math
+import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 
 
+LOGGER = logging.getLogger("set_generator")
 DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "db" / "dj_library.sqlite3"
 CONFIG_PATH = Path.home() / ".djlibrary" / "config.json"
 
@@ -36,69 +37,137 @@ def _get_connection() -> sqlite3.Connection:
     return connection
 
 
-def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
-    rows = connection.execute(f"PRAGMA table_info({table_name})").fetchall()
-    return {row["name"] for row in rows}
+def _load_similarity_map(connection: sqlite3.Connection) -> dict[tuple[str, str], float]:
+    rows = connection.execute(
+        """
+        SELECT file_path_a, file_path_b, similarity
+        FROM similarities
+        """
+    ).fetchall()
 
-
-def _load_tracks() -> tuple[list[dict[str, Any]], dict[tuple[str, str], float]]:
-    with _get_connection() as connection:
-        columns = _table_columns(connection, "audio_features")
-        vocal_select = ", af.vocal_presence" if "vocal_presence" in columns else ", NULL AS vocal_presence"
-        track_rows = connection.execute(
-            f"""
-            SELECT
-                t.file_path,
-                COALESCE(t.artist, 'Unknown Artist') AS artist,
-                COALESCE(t.title, 'Unknown Title') AS title,
-                af.bpm,
-                af.energy
-                {vocal_select}
-            FROM tracks AS t
-            JOIN audio_features AS af
-                ON af.file_path = t.file_path
-            WHERE af.bpm IS NOT NULL
-              AND af.energy IS NOT NULL
-            ORDER BY t.artist COLLATE NOCASE, t.title COLLATE NOCASE
-            """
-        ).fetchall()
-        similarity_rows = connection.execute(
-            """
-            SELECT file_path_a, file_path_b, similarity
-            FROM similarities
-            """
-        ).fetchall()
-
-    tracks = [dict(row) for row in track_rows]
     similarity_map: dict[tuple[str, str], float] = {}
-    for row in similarity_rows:
-        pair = (row["file_path_a"], row["file_path_b"])
-        reverse_pair = (row["file_path_b"], row["file_path_a"])
-        similarity = float(row["similarity"])
-        similarity_map[pair] = similarity
-        similarity_map[reverse_pair] = max(similarity, similarity_map.get(reverse_pair, 0.0))
-
-    return tracks, similarity_map
+    for row in rows:
+        similarity_map[(str(row["file_path_a"]), str(row["file_path_b"]))] = float(row["similarity"])
+    return similarity_map
 
 
-def _phase_counts(length: int, ratios: list[float]) -> list[int]:
-    raw_counts = [length * ratio for ratio in ratios]
-    counts = [math.floor(value) for value in raw_counts]
-    remainder = length - sum(counts)
-    fractional_parts = sorted(
-        range(len(raw_counts)),
-        key=lambda index: (raw_counts[index] - counts[index], -index),
-        reverse=True,
-    )
-    for index in fractional_parts[:remainder]:
-        counts[index] += 1
-    return counts
+def _club_phase_plan(length: int) -> list[dict[str, Any]]:
+    warmup_count = int(length * 0.20)
+    buildup_count = int(length * 0.25)
+    closing_count = int(length * 0.15)
+    peaktime_count = length - warmup_count - buildup_count - closing_count
+
+    return [
+        {
+            "name": "warm-up",
+            "count": warmup_count,
+            "where_clause": "af.energy < 0.5 AND af.bpm < 120",
+            "target_bpm": 110.0,
+            "target_energy": 0.40,
+            "prefer_low_vocals": False,
+        },
+        {
+            "name": "build-up",
+            "count": buildup_count,
+            "where_clause": "af.energy >= 0.5 AND af.energy <= 0.75 AND af.bpm >= 120 AND af.bpm <= 128",
+            "target_bpm": 124.0,
+            "target_energy": 0.62,
+            "prefer_low_vocals": False,
+        },
+        {
+            "name": "peak-time",
+            "count": peaktime_count,
+            "where_clause": "af.energy > 0.75 AND af.bpm > 128",
+            "target_bpm": 132.0,
+            "target_energy": 0.85,
+            "prefer_low_vocals": False,
+        },
+        {
+            "name": "closing",
+            "count": closing_count,
+            "where_clause": "af.energy >= 0.4 AND af.energy <= 0.75",
+            "target_bpm": 120.0,
+            "target_energy": 0.55,
+            "prefer_low_vocals": False,
+        },
+    ]
 
 
-def _artist_allowed(candidate_artist: str, recent_artists: list[str]) -> bool:
-    if len(recent_artists) < 2:
-        return True
-    return not (recent_artists[-1] == candidate_artist and recent_artists[-2] == candidate_artist)
+def _afterhours_phase_plan(length: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "afterhours",
+            "count": length,
+            "where_clause": "af.energy < 0.5 AND af.bpm >= 120 AND af.bpm <= 130",
+            "target_bpm": 125.0,
+            "target_energy": 0.35,
+            "prefer_low_vocals": True,
+        }
+    ]
+
+
+def _warmup_phase_plan(length: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "name": "warmup",
+            "count": length,
+            "where_clause": "af.energy < 0.45 AND af.bpm >= 100 AND af.bpm <= 118",
+            "target_bpm": 109.0,
+            "target_energy": 0.30,
+            "prefer_low_vocals": False,
+        }
+    ]
+
+
+def _phase_plan(trajectory: str, length: int) -> list[dict[str, Any]]:
+    if trajectory == "club":
+        return _club_phase_plan(length)
+    if trajectory == "afterhours":
+        return _afterhours_phase_plan(length)
+    if trajectory == "warmup":
+        return _warmup_phase_plan(length)
+    raise ValueError("Trajectory moet 'club', 'afterhours' of 'warmup' zijn.")
+
+
+def _query_phase_tracks(connection: sqlite3.Connection, where_clause: str) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        f"""
+        SELECT
+            t.file_path,
+            COALESCE(t.artist, 'Unknown Artist') AS artist,
+            COALESCE(t.title, 'Unknown Title') AS title,
+            af.bpm,
+            af.energy,
+            af.vocal_presence
+        FROM audio_features AS af
+        JOIN tracks AS t
+            ON t.file_path = af.file_path
+        WHERE {where_clause}
+        ORDER BY t.artist COLLATE NOCASE, t.title COLLATE NOCASE
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def _query_all_tracks(connection: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = connection.execute(
+        """
+        SELECT
+            t.file_path,
+            COALESCE(t.artist, 'Unknown Artist') AS artist,
+            COALESCE(t.title, 'Unknown Title') AS title,
+            af.bpm,
+            af.energy,
+            af.vocal_presence
+        FROM audio_features AS af
+        JOIN tracks AS t
+            ON t.file_path = af.file_path
+        WHERE af.bpm IS NOT NULL
+          AND af.energy IS NOT NULL
+        ORDER BY t.artist COLLATE NOCASE, t.title COLLATE NOCASE
+        """
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def _similarity_with_previous(
@@ -109,193 +178,152 @@ def _similarity_with_previous(
     if previous_track is None:
         return 0.0
     return float(
-        similarity_map.get((previous_track["file_path"], candidate_track["file_path"]), 0.0)
+        similarity_map.get(
+            (str(previous_track["file_path"]), str(candidate_track["file_path"])),
+            0.0,
+        )
     )
 
 
-def _pick_track(
+def _criteria_distance(track: dict[str, Any], target_bpm: float, target_energy: float) -> float:
+    return abs(float(track["bpm"]) - target_bpm) + abs(float(track["energy"]) - target_energy)
+
+
+def _creates_three_artist_streak(candidate_artist: str, selected_tracks: list[dict[str, Any]]) -> bool:
+    if len(selected_tracks) < 2:
+        return False
+    return (
+        str(selected_tracks[-1]["artist"]) == candidate_artist
+        and str(selected_tracks[-2]["artist"]) == candidate_artist
+    )
+
+
+def _pick_candidate(
     candidates: list[dict[str, Any]],
+    selected_paths: set[str],
+    selected_tracks: list[dict[str, Any]],
     previous_track: dict[str, Any] | None,
-    recent_artists: list[str],
-    used_paths: set[str],
     similarity_map: dict[tuple[str, str], float],
-    target_bpm: float | None = None,
-    target_energy: float | None = None,
-    prefer_low_vocals: bool = False,
+    target_bpm: float,
+    target_energy: float,
+    prefer_low_vocals: bool,
+    fallback_mode: bool,
 ) -> dict[str, Any] | None:
-    available = [track for track in candidates if track["file_path"] not in used_paths]
+    available = [candidate for candidate in candidates if candidate["file_path"] not in selected_paths]
     if not available:
         return None
 
-    def sort_key(track: dict[str, Any]) -> tuple[float, float, float, float, str, str]:
+    def ranking_key(track: dict[str, Any]) -> tuple[float, float, float, str, str]:
         similarity = _similarity_with_previous(previous_track, track, similarity_map)
-        bpm_score = -abs(float(track["bpm"]) - target_bpm) if target_bpm is not None else 0.0
-        energy_score = -abs(float(track["energy"]) - target_energy) if target_energy is not None else 0.0
+        distance = _criteria_distance(track, target_bpm, target_energy)
         vocal_value = float(track["vocal_presence"]) if track["vocal_presence"] is not None else 0.5
         vocal_score = -vocal_value if prefer_low_vocals else 0.0
+        if fallback_mode:
+            return (
+                -distance,
+                similarity,
+                vocal_score,
+                str(track["artist"]).lower(),
+                str(track["title"]).lower(),
+            )
         return (
             similarity,
-            bpm_score,
-            energy_score,
+            -distance,
             vocal_score,
             str(track["artist"]).lower(),
             str(track["title"]).lower(),
         )
 
-    available.sort(key=sort_key, reverse=True)
+    ranked = sorted(available, key=ranking_key, reverse=True)
+    for candidate in ranked:
+        if not _creates_three_artist_streak(str(candidate["artist"]), selected_tracks):
+            return candidate
 
-    for track in available:
-        if _artist_allowed(str(track["artist"]), recent_artists):
-            return track
+    warning_candidate = ranked[0]
+    LOGGER.warning(
+        "Geen alternatieve artiest gevonden na %s; herhaling geaccepteerd voor %s.",
+        str(selected_tracks[-1]["artist"]) if selected_tracks else "lege set",
+        str(warning_candidate["file_path"]),
+    )
+    return warning_candidate
 
-    return available[0]
 
-
-def _club_phases(length: int) -> list[dict[str, Any]]:
-    counts = _phase_counts(length, [0.20, 0.25, 0.40, 0.15])
-    return [
+def _append_track(
+    selected_tracks: list[dict[str, Any]],
+    selected_paths: set[str],
+    chosen: dict[str, Any],
+    phase_name: str,
+) -> None:
+    selected_paths.add(str(chosen["file_path"]))
+    selected_tracks.append(
         {
-            "name": "warm-up",
-            "count": counts[0],
-            "filter": lambda track: float(track["energy"]) < 0.5 and float(track["bpm"]) < 120,
-            "target_bpm": lambda index, total: 100 + (18 * index / max(total - 1, 1)),
-            "target_energy": lambda index, total: 0.30 + (0.18 * index / max(total - 1, 1)),
-            "prefer_low_vocals": False,
-        },
-        {
-            "name": "build-up",
-            "count": counts[1],
-            "filter": lambda track: 0.5 <= float(track["energy"]) <= 0.75 and 120 <= float(track["bpm"]) <= 128,
-            "target_bpm": lambda index, total: 120 + (8 * index / max(total - 1, 1)),
-            "target_energy": lambda index, total: 0.50 + (0.25 * index / max(total - 1, 1)),
-            "prefer_low_vocals": False,
-        },
-        {
-            "name": "peak-time",
-            "count": counts[2],
-            "filter": lambda track: float(track["energy"]) > 0.75 and float(track["bpm"]) > 128,
-            "target_bpm": lambda index, total: 128 + (8 * index / max(total - 1, 1)),
-            "target_energy": lambda index, total: 0.76 + (0.18 * index / max(total - 1, 1)),
-            "prefer_low_vocals": False,
-        },
-        {
-            "name": "closing",
-            "count": counts[3],
-            "filter": lambda track: 0.4 <= float(track["energy"]) <= 0.75,
-            "target_bpm": lambda index, total: 126 - (10 * index / max(total - 1, 1)),
-            "target_energy": lambda index, total: 0.75 - (0.35 * index / max(total - 1, 1)),
-            "prefer_low_vocals": False,
-        },
-    ]
-
-
-def _afterhours_phases(length: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": "afterhours",
-            "count": length,
-            "filter": lambda track: float(track["energy"]) < 0.5 and 120 <= float(track["bpm"]) <= 130,
-            "target_bpm": lambda index, total: 122 + (6 * index / max(total - 1, 1)),
-            "target_energy": lambda index, total: 0.28 + (0.16 * index / max(total - 1, 1)),
-            "prefer_low_vocals": True,
+            "file_path": str(chosen["file_path"]),
+            "artist": str(chosen["artist"]),
+            "title": str(chosen["title"]),
+            "bpm": float(chosen["bpm"]),
+            "energy": float(chosen["energy"]),
+            "phase": phase_name,
         }
-    ]
-
-
-def _warmup_phases(length: int) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": "warm-up",
-            "count": length,
-            "filter": lambda track: float(track["energy"]) < 0.45 and 100 <= float(track["bpm"]) <= 118,
-            "target_bpm": lambda index, total: 100 + (18 * index / max(total - 1, 1)),
-            "target_energy": lambda index, total: 0.20 + (0.20 * index / max(total - 1, 1)),
-            "prefer_low_vocals": False,
-        }
-    ]
-
-
-def _phase_plan(trajectory: str, length: int) -> list[dict[str, Any]]:
-    if trajectory == "club":
-        return _club_phases(length)
-    if trajectory == "afterhours":
-        return _afterhours_phases(length)
-    if trajectory == "warmup":
-        return _warmup_phases(length)
-    raise ValueError("Trajectory moet 'club', 'afterhours' of 'warmup' zijn.")
+    )
 
 
 def generate_set(trajectory: str, length: int) -> list[dict[str, Any]]:
+    if trajectory not in {"club", "afterhours", "warmup"}:
+        raise ValueError("Trajectory moet 'club', 'afterhours' of 'warmup' zijn.")
     if length <= 0:
         return []
 
-    tracks, similarity_map = _load_tracks()
-    phase_plan = _phase_plan(trajectory, length)
+    with _get_connection() as connection:
+        similarity_map = _load_similarity_map(connection)
+        all_tracks = _query_all_tracks(connection)
+        phase_plan = _phase_plan(trajectory, length)
 
-    selected_tracks: list[dict[str, Any]] = []
-    used_paths: set[str] = set()
-    recent_artists: list[str] = []
-    previous_track: dict[str, Any] | None = None
+        selected_tracks: list[dict[str, Any]] = []
+        selected_paths: set[str] = set()
 
-    for phase in phase_plan:
-        phase_candidates = [track for track in tracks if phase["filter"](track)]
-        for index in range(phase["count"]):
-            target_bpm = phase["target_bpm"](index, phase["count"])
-            target_energy = phase["target_energy"](index, phase["count"])
-            chosen = _pick_track(
-                candidates=phase_candidates,
-                previous_track=previous_track,
-                recent_artists=recent_artists,
-                used_paths=used_paths,
-                similarity_map=similarity_map,
-                target_bpm=target_bpm,
-                target_energy=target_energy,
-                prefer_low_vocals=bool(phase["prefer_low_vocals"]),
-            )
-            if chosen is None:
-                break
+        for phase in phase_plan:
+            phase_tracks = _query_phase_tracks(connection, str(phase["where_clause"]))
+            previous_track = selected_tracks[-1] if selected_tracks else None
 
-            used_paths.add(chosen["file_path"])
-            recent_artists.append(str(chosen["artist"]))
-            recent_artists = recent_artists[-2:]
-            previous_track = chosen
-            selected_tracks.append(
-                {
-                    "file_path": chosen["file_path"],
-                    "artist": chosen["artist"],
-                    "title": chosen["title"],
-                    "bpm": float(chosen["bpm"]),
-                    "energy": float(chosen["energy"]),
-                    "phase": phase["name"],
-                }
-            )
+            for _ in range(int(phase["count"])):
+                candidate = _pick_candidate(
+                    candidates=phase_tracks,
+                    selected_paths=selected_paths,
+                    selected_tracks=selected_tracks,
+                    previous_track=previous_track,
+                    similarity_map=similarity_map,
+                    target_bpm=float(phase["target_bpm"]),
+                    target_energy=float(phase["target_energy"]),
+                    prefer_low_vocals=bool(phase["prefer_low_vocals"]),
+                    fallback_mode=False,
+                )
 
-    if len(selected_tracks) < length:
-        remaining_tracks = [track for track in tracks if track["file_path"] not in used_paths]
-        while len(selected_tracks) < length and remaining_tracks:
-            chosen = _pick_track(
-                candidates=remaining_tracks,
-                previous_track=previous_track,
-                recent_artists=recent_artists,
-                used_paths=used_paths,
-                similarity_map=similarity_map,
-            )
-            if chosen is None:
-                break
-            used_paths.add(chosen["file_path"])
-            recent_artists.append(str(chosen["artist"]))
-            recent_artists = recent_artists[-2:]
-            previous_track = chosen
-            selected_tracks.append(
-                {
-                    "file_path": chosen["file_path"],
-                    "artist": chosen["artist"],
-                    "title": chosen["title"],
-                    "bpm": float(chosen["bpm"]),
-                    "energy": float(chosen["energy"]),
-                    "phase": "fallback",
-                }
-            )
-            remaining_tracks = [track for track in remaining_tracks if track["file_path"] not in used_paths]
+                if candidate is None:
+                    fallback_candidate = _pick_candidate(
+                        candidates=all_tracks,
+                        selected_paths=selected_paths,
+                        selected_tracks=selected_tracks,
+                        previous_track=previous_track,
+                        similarity_map=similarity_map,
+                        target_bpm=float(phase["target_bpm"]),
+                        target_energy=float(phase["target_energy"]),
+                        prefer_low_vocals=bool(phase["prefer_low_vocals"]),
+                        fallback_mode=True,
+                    )
+                    if fallback_candidate is None:
+                        LOGGER.warning(
+                            "Geen tracks beschikbaar voor ontbrekende plek in fase %s.",
+                            str(phase["name"]),
+                        )
+                        continue
+                    LOGGER.warning(
+                        "Fase %s had geen directe match; fallback gebruikt voor %s.",
+                        str(phase["name"]),
+                        str(fallback_candidate["file_path"]),
+                    )
+                    candidate = fallback_candidate
 
-    return selected_tracks[:length]
+                _append_track(selected_tracks, selected_paths, candidate, str(phase["name"]))
+                previous_track = selected_tracks[-1]
+
+        return selected_tracks[:length]
