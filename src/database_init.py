@@ -84,8 +84,14 @@ CREATE TABLE IF NOT EXISTS feedback (
     file_path_a TEXT NOT NULL,
     file_path_b TEXT NOT NULL,
     rating INTEGER NOT NULL CHECK (rating IN (-1, 1)),
-    created_at TEXT NOT NULL
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (file_path_a, file_path_b)
 )
+"""
+
+CREATE_FEEDBACK_UNIQUE_INDEX = """
+CREATE UNIQUE INDEX IF NOT EXISTS idx_feedback_file_pair
+ON feedback (file_path_a, file_path_b)
 """
 
 CREATE_TABLE_STATEMENTS = (
@@ -179,6 +185,31 @@ def _ensure_columns(
         )
 
 
+def _deduplicate_feedback(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        DELETE FROM feedback
+        WHERE rowid NOT IN (
+            SELECT rowid
+            FROM feedback AS f
+            WHERE rowid = (
+                SELECT f2.rowid
+                FROM feedback AS f2
+                WHERE f2.file_path_a = f.file_path_a
+                  AND f2.file_path_b = f.file_path_b
+                ORDER BY f2.created_at DESC, f2.rowid DESC
+                LIMIT 1
+            )
+        )
+        """
+    )
+
+
+def ensure_feedback_uniqueness(connection: sqlite3.Connection) -> None:
+    _deduplicate_feedback(connection)
+    connection.execute(CREATE_FEEDBACK_UNIQUE_INDEX)
+
+
 def init_db(db_path: str | Path) -> None:
     database_path = Path(db_path).expanduser()
     database_path.parent.mkdir(parents=True, exist_ok=True)
@@ -192,5 +223,7 @@ def init_db(db_path: str | Path) -> None:
 
         for table_name, columns in EXPECTED_COLUMNS.items():
             _ensure_columns(connection, table_name, columns)
+
+        ensure_feedback_uniqueness(connection)
 
         connection.commit()

@@ -1,7 +1,28 @@
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
+
+try:
+    from db_utils import get_connection, table_exists
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.db_utils import get_connection, table_exists
+
+try:
+    from domain_constants import (
+        BPM_PEAKTIME_MIN,
+        BPM_WARMUP_MAX,
+        ENERGY_LOW_MAX,
+        ENERGY_MID_MAX,
+        VOCAL_TOOLS_MIN,
+    )
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.domain_constants import (
+        BPM_PEAKTIME_MIN,
+        BPM_WARMUP_MAX,
+        ENERGY_LOW_MAX,
+        ENERGY_MID_MAX,
+        VOCAL_TOOLS_MIN,
+    )
 
 try:
     from database_init import CREATE_CRATES_TABLE
@@ -9,30 +30,7 @@ except ModuleNotFoundError:  # pragma: no cover - import fallback for project-ro
     from src.database_init import CREATE_CRATES_TABLE
 
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "db" / "dj_library.sqlite3"
-_DB_PATH = DEFAULT_DB_PATH
-
-
-def set_database_path(db_path: str | Path) -> None:
-    global _DB_PATH
-    _DB_PATH = Path(db_path).expanduser()
-
-
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(_DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
-    row = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
-
-
-def ensure_required_tables(connection: sqlite3.Connection) -> None:
+def ensure_required_tables(connection) -> None:
     required_tables = (
         "tracks",
         "audio_features",
@@ -46,12 +44,12 @@ def ensure_required_tables(connection: sqlite3.Connection) -> None:
         raise RuntimeError(f"Ontbrekende tabellen: {', '.join(missing)}")
 
 
-def ensure_crates_table(connection: sqlite3.Connection) -> None:
+def ensure_crates_table(connection) -> None:
     connection.execute(CREATE_CRATES_TABLE)
     connection.commit()
 
 
-def _audio_feature_crates(connection: sqlite3.Connection) -> dict[str, set[str]]:
+def _audio_feature_crates(connection) -> dict[str, set[str]]:
     return {
         "Warm-up": {
             row["file_path"]
@@ -59,8 +57,10 @@ def _audio_feature_crates(connection: sqlite3.Connection) -> dict[str, set[str]]
                 """
                 SELECT file_path
                 FROM audio_features
-                WHERE energy < 0.4 AND bpm < 110
+                WHERE energy < ? AND bpm < ?
                 """
+                ,
+                (ENERGY_LOW_MAX, BPM_WARMUP_MAX),
             ).fetchall()
         },
         "Peak-time": {
@@ -69,8 +69,10 @@ def _audio_feature_crates(connection: sqlite3.Connection) -> dict[str, set[str]]
                 """
                 SELECT file_path
                 FROM audio_features
-                WHERE energy > 0.75 AND bpm > 128
+                WHERE energy > ? AND bpm > ?
                 """
+                ,
+                (ENERGY_MID_MAX, BPM_PEAKTIME_MIN),
             ).fetchall()
         },
         "Late night": {
@@ -79,8 +81,10 @@ def _audio_feature_crates(connection: sqlite3.Connection) -> dict[str, set[str]]
                 """
                 SELECT file_path
                 FROM audio_features
-                WHERE energy < 0.4 AND bpm > 110
+                WHERE energy < ? AND bpm > ?
                 """
+                ,
+                (ENERGY_LOW_MAX, BPM_WARMUP_MAX),
             ).fetchall()
         },
         "Vocal tools": {
@@ -89,8 +93,10 @@ def _audio_feature_crates(connection: sqlite3.Connection) -> dict[str, set[str]]
                 """
                 SELECT file_path
                 FROM audio_features
-                WHERE vocal_presence > 0.65
+                WHERE vocal_presence > ?
                 """
+                ,
+                (VOCAL_TOOLS_MIN,),
             ).fetchall()
         },
         "Orphan tracks": {
@@ -106,7 +112,7 @@ def _audio_feature_crates(connection: sqlite3.Connection) -> dict[str, set[str]]
     }
 
 
-def _bridge_tracks(connection: sqlite3.Connection) -> set[str]:
+def _bridge_tracks(connection) -> set[str]:
     cluster_pairs = connection.execute(
         """
         SELECT a.cluster_id AS cluster_a_id, b.cluster_id AS cluster_b_id
@@ -147,8 +153,8 @@ def _bridge_tracks(connection: sqlite3.Connection) -> set[str]:
     return bridge_paths
 
 
-def generate_crates() -> dict[str, int]:
-    with get_connection() as connection:
+def generate_crates(db_path: str | Path | None = None) -> dict[str, int]:
+    with get_connection(db_path) as connection:
         ensure_required_tables(connection)
         ensure_crates_table(connection)
 

@@ -10,11 +10,12 @@
 
 1. Importeer je lokale muziekbibliotheek: `python3 src/library_importer.py --db-path ./data/db/dj_library.sqlite3`
 2. Verrijk de database met analyse: `python3 src/audio_feature_extractor.py --db-path ./data/db/dj_library.sqlite3`, daarna `python3 src/similarity_engine.py --db-path ./data/db/dj_library.sqlite3` en `python3 src/clustering_engine.py --db-path ./data/db/dj_library.sqlite3`
-3. Start de desktopapp: `python3 src/main_window.py`
+3. Start de desktopapp: `python3 src/main_window.py` en gebruik indien nodig database-tools zoals `python3 src/database_tools.py inspect --db-path ./data/db/dj_library.sqlite3`, `python3 src/database_tools.py export ./backups/dj_library_backup.sqlite3 --db-path ./data/db/dj_library.sqlite3` of `python3 src/database_tools.py reset --db-path ./data/db/dj_library.sqlite3 --backup-path ./backups/pre_reset.sqlite3 --force`
 
 ## Modules
 
 - `src/database_init.py`: initialiseert alle vereiste SQLite-tabellen en vult ontbrekende kolommen veilig aan.
+- `src/database_tools.py`: biedt CLI-commando's voor database-inspectie, export/backup en reset met optionele backup vooraf.
 - `src/library_importer.py`: detecteert automatisch de beste lokale muziekbron en schrijft unieke tracks weg naar `tracks`.
 - `src/audio_feature_extractor.py`: berekent audiofeatures per track en vult alleen ontbrekende featurewaarden aan.
 - `src/similarity_engine.py`: bouwt genormaliseerde featurevectoren en schrijft per track de beste similarity-matches weg.

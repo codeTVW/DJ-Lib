@@ -1,43 +1,29 @@
 from __future__ import annotations
 
-import sqlite3
 from itertools import combinations
 from pathlib import Path
 from typing import Any
 
+try:
+    from db_utils import get_connection, table_exists
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.db_utils import get_connection, table_exists
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "db" / "dj_library.sqlite3"
-_DB_PATH = DEFAULT_DB_PATH
-
-
-def set_database_path(db_path: str | Path) -> None:
-    global _DB_PATH
-    _DB_PATH = Path(db_path).expanduser()
-
-
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(_DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
+try:
+    from domain_constants import BPM_HISTOGRAM_BIN_SIZE, BPM_HISTOGRAM_MAX, BPM_HISTOGRAM_MIN
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.domain_constants import BPM_HISTOGRAM_BIN_SIZE, BPM_HISTOGRAM_MAX, BPM_HISTOGRAM_MIN
 
 
-def table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
-    row = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
-
-
-def ensure_required_tables(connection: sqlite3.Connection) -> None:
+def ensure_required_tables(connection) -> None:
     required_tables = ("tracks", "audio_features", "similarities", "clusters", "cluster_metadata", "crates")
     missing = [name for name in required_tables if not table_exists(connection, name)]
     if missing:
         raise RuntimeError(f"Ontbrekende tabellen: {', '.join(missing)}")
 
 
-def find_orphans() -> list[dict[str, Any]]:
-    with get_connection() as connection:
+def find_orphans(db_path: str | Path | None = None) -> list[dict[str, Any]]:
+    with get_connection(db_path) as connection:
         ensure_required_tables(connection)
         rows = connection.execute(
             """
@@ -76,8 +62,8 @@ def find_orphans() -> list[dict[str, Any]]:
     ]
 
 
-def find_overcrowded_clusters() -> list[dict[str, Any]]:
-    with get_connection() as connection:
+def find_overcrowded_clusters(db_path: str | Path | None = None) -> list[dict[str, Any]]:
+    with get_connection(db_path) as connection:
         ensure_required_tables(connection)
         rows = connection.execute(
             """
@@ -104,8 +90,8 @@ def find_overcrowded_clusters() -> list[dict[str, Any]]:
     ]
 
 
-def find_missing_bridges() -> list[dict[str, Any]]:
-    with get_connection() as connection:
+def find_missing_bridges(db_path: str | Path | None = None) -> list[dict[str, Any]]:
+    with get_connection(db_path) as connection:
         ensure_required_tables(connection)
         cluster_rows = connection.execute(
             """
@@ -157,8 +143,8 @@ def find_missing_bridges() -> list[dict[str, Any]]:
     return missing_pairs
 
 
-def get_collection_stats() -> dict[str, Any]:
-    with get_connection() as connection:
+def get_collection_stats(db_path: str | Path | None = None) -> dict[str, Any]:
+    with get_connection(db_path) as connection:
         ensure_required_tables(connection)
 
         total_tracks = int(connection.execute("SELECT COUNT(*) FROM tracks").fetchone()[0])
@@ -192,8 +178,10 @@ def get_collection_stats() -> dict[str, Any]:
             """
             SELECT bpm
             FROM audio_features
-            WHERE bpm BETWEEN 60 AND 229.999
+            WHERE bpm BETWEEN ? AND ?
             """
+            ,
+            (BPM_HISTOGRAM_MIN, BPM_HISTOGRAM_MAX + BPM_HISTOGRAM_BIN_SIZE - 0.001),
         ).fetchall()
 
     crate_percentages = {
@@ -204,15 +192,18 @@ def get_collection_stats() -> dict[str, Any]:
         for row in crate_rows
     }
 
-    bpm_histogram = {f"{start}-{start + 9}": 0 for start in range(60, 221, 10)}
+    bpm_histogram = {
+        f"{start}-{start + BPM_HISTOGRAM_BIN_SIZE - 1}": 0
+        for start in range(BPM_HISTOGRAM_MIN, BPM_HISTOGRAM_MAX + 1, BPM_HISTOGRAM_BIN_SIZE)
+    }
     for row in bpm_rows:
         bpm = float(row["bpm"])
-        bucket_start = int(bpm // 10 * 10)
-        if bucket_start < 60:
+        bucket_start = int(bpm // BPM_HISTOGRAM_BIN_SIZE * BPM_HISTOGRAM_BIN_SIZE)
+        if bucket_start < BPM_HISTOGRAM_MIN:
             continue
-        if bucket_start > 220:
-            bucket_start = 220
-        label = f"{bucket_start}-{bucket_start + 9}"
+        if bucket_start > BPM_HISTOGRAM_MAX:
+            bucket_start = BPM_HISTOGRAM_MAX
+        label = f"{bucket_start}-{bucket_start + BPM_HISTOGRAM_BIN_SIZE - 1}"
         bpm_histogram[label] = bpm_histogram.get(label, 0) + 1
 
     return {

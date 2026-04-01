@@ -1,8 +1,12 @@
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 from typing import Any
+
+try:
+    from db_utils import get_connection, table_exists
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.db_utils import get_connection, table_exists
 
 try:
     from similarity_engine import to_camelot_code
@@ -10,30 +14,7 @@ except ModuleNotFoundError:  # pragma: no cover - import fallback for project-ro
     from src.similarity_engine import to_camelot_code
 
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "db" / "dj_library.sqlite3"
-_DB_PATH = DEFAULT_DB_PATH
-
-
-def set_database_path(db_path: str | Path) -> None:
-    global _DB_PATH
-    _DB_PATH = Path(db_path).expanduser()
-
-
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(_DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
-    row = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
-
-
-def ensure_required_tables(connection: sqlite3.Connection) -> None:
+def ensure_required_tables(connection) -> None:
     required_tables = ("tracks", "audio_features", "similarities")
     missing = [name for name in required_tables if not table_exists(connection, name)]
     if missing:
@@ -44,7 +25,7 @@ def _word_count(text: str) -> int:
     return len([part for part in text.replace(",", " ").replace(".", " ").split() if part])
 
 
-def _build_reason(row: sqlite3.Row) -> str:
+def _build_reason(row) -> str:
     facts: list[tuple[int, str]] = []
 
     bpm_difference = abs(float(row["source_bpm"]) - float(row["target_bpm"]))
@@ -77,6 +58,7 @@ def get_next_tracks(
     file_path: str,
     played_tracks: list[str] = [],
     n: int = 5,
+    db_path: str | Path | None = None,
 ) -> list[dict[str, Any]]:
     if n <= 0:
         return []
@@ -84,7 +66,7 @@ def get_next_tracks(
     excluded_paths = list(played_tracks)
     excluded_paths.append(file_path)
 
-    with get_connection() as connection:
+    with get_connection(db_path) as connection:
         ensure_required_tables(connection)
 
         where_clause = "WHERE s.file_path_a = ?"

@@ -11,6 +11,23 @@ import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
 
 try:
+    from domain_constants import (
+        SIMILARITY_CREATIVE_MAX,
+        SIMILARITY_CREATIVE_MAX_BPM_DIFF,
+        SIMILARITY_CREATIVE_MIN,
+        SIMILARITY_SAFE_MAX_BPM_DIFF,
+        SIMILARITY_SAFE_MIN,
+    )
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.domain_constants import (
+        SIMILARITY_CREATIVE_MAX,
+        SIMILARITY_CREATIVE_MAX_BPM_DIFF,
+        SIMILARITY_CREATIVE_MIN,
+        SIMILARITY_SAFE_MAX_BPM_DIFF,
+        SIMILARITY_SAFE_MIN,
+    )
+
+try:
     from database_init import CREATE_SIMILARITIES_TABLE
 except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
     from src.database_init import CREATE_SIMILARITIES_TABLE
@@ -261,9 +278,16 @@ def classify_mix_type(
     mode_b: int,
 ) -> str:
     bpm_difference = abs(bpm_a - bpm_b)
-    if similarity > 0.85 and bpm_difference < 4.0 and camelot_compatible(key_a, mode_a, key_b, mode_b):
+    if (
+        similarity > SIMILARITY_SAFE_MIN
+        and bpm_difference < SIMILARITY_SAFE_MAX_BPM_DIFF
+        and camelot_compatible(key_a, mode_a, key_b, mode_b)
+    ):
         return "safe"
-    if 0.65 <= similarity <= 0.85 and bpm_difference < 8.0:
+    if (
+        SIMILARITY_CREATIVE_MIN <= similarity <= SIMILARITY_CREATIVE_MAX
+        and bpm_difference < SIMILARITY_CREATIVE_MAX_BPM_DIFF
+    ):
         return "creative"
     return "risky"
 

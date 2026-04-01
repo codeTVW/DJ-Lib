@@ -1,14 +1,18 @@
 from __future__ import annotations
 
-import sqlite3
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 try:
-    from database_init import CREATE_FEEDBACK_TABLE
+    from db_utils import get_connection, table_exists
 except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
-    from src.database_init import CREATE_FEEDBACK_TABLE
+    from src.db_utils import get_connection, table_exists
+
+try:
+    from database_init import CREATE_FEEDBACK_TABLE, ensure_feedback_uniqueness
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.database_init import CREATE_FEEDBACK_TABLE, ensure_feedback_uniqueness
 
 try:
     from similarity_engine import classify_mix_type
@@ -16,35 +20,13 @@ except ModuleNotFoundError:  # pragma: no cover - import fallback for project-ro
     from src.similarity_engine import classify_mix_type
 
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "db" / "dj_library.sqlite3"
-_DB_PATH = DEFAULT_DB_PATH
-
-
-def set_database_path(db_path: str | Path) -> None:
-    global _DB_PATH
-    _DB_PATH = Path(db_path).expanduser()
-
-
-def get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(_DB_PATH)
-    connection.row_factory = sqlite3.Row
-    return connection
-
-
-def ensure_feedback_table(connection: sqlite3.Connection) -> None:
+def ensure_feedback_table(connection) -> None:
     connection.execute(CREATE_FEEDBACK_TABLE)
+    ensure_feedback_uniqueness(connection)
     connection.commit()
 
 
-def table_exists(connection: sqlite3.Connection, table_name: str) -> bool:
-    row = connection.execute(
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?",
-        (table_name,),
-    ).fetchone()
-    return row is not None
-
-
-def ensure_required_tables(connection: sqlite3.Connection) -> None:
+def ensure_required_tables(connection) -> None:
     required_tables = ("audio_features", "similarities")
     missing = [name for name in required_tables if not table_exists(connection, name)]
     if missing:
@@ -55,23 +37,32 @@ def current_timestamp() -> str:
     return datetime.utcnow().isoformat()
 
 
-def record_feedback(file_path_a: str, file_path_b: str, rating: int) -> None:
+def record_feedback(
+    file_path_a: str,
+    file_path_b: str,
+    rating: int,
+    db_path: str | Path | None = None,
+) -> None:
     if rating not in {1, -1}:
         raise ValueError("Rating moet 1 of -1 zijn.")
 
-    with get_connection() as connection:
+    with get_connection(db_path) as connection:
         ensure_feedback_table(connection)
         connection.execute(
             """
             INSERT INTO feedback (file_path_a, file_path_b, rating, created_at)
             VALUES (?, ?, ?, ?)
+            ON CONFLICT(file_path_a, file_path_b)
+            DO UPDATE SET
+                rating = excluded.rating,
+                created_at = excluded.created_at
             """,
             (file_path_a, file_path_b, rating, current_timestamp()),
         )
         connection.commit()
 
 
-def _pair_row(connection: sqlite3.Connection, file_path_a: str, file_path_b: str) -> sqlite3.Row | None:
+def _pair_row(connection, file_path_a: str, file_path_b: str):
     return connection.execute(
         """
         SELECT
@@ -94,8 +85,8 @@ def _pair_row(connection: sqlite3.Connection, file_path_a: str, file_path_b: str
     ).fetchone()
 
 
-def apply_feedback() -> int:
-    with get_connection() as connection:
+def apply_feedback(db_path: str | Path | None = None) -> int:
+    with get_connection(db_path) as connection:
         ensure_feedback_table(connection)
         ensure_required_tables(connection)
 
@@ -146,8 +137,8 @@ def apply_feedback() -> int:
     return updated_rows
 
 
-def get_feedback_stats() -> dict[str, Any]:
-    with get_connection() as connection:
+def get_feedback_stats(db_path: str | Path | None = None) -> dict[str, Any]:
+    with get_connection(db_path) as connection:
         ensure_feedback_table(connection)
 
         summary_row = connection.execute(

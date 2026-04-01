@@ -3,12 +3,20 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+import os
 import sqlite3
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 import librosa
+
+try:
+    from domain_constants import UNUSUAL_BPM_MAX, UNUSUAL_BPM_MIN
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.domain_constants import UNUSUAL_BPM_MAX, UNUSUAL_BPM_MIN
 
 try:
     from database_init import init_db
@@ -21,6 +29,16 @@ HOP_LENGTH = 512
 INTRO_OUTRO_THRESHOLD = 0.15
 INTRO_STABLE_SECONDS = 3.0
 STALE_DAYS = 7
+COMMIT_INTERVAL = 25
+
+
+@dataclass(frozen=True)
+class TrackProcessingResult:
+    file_path: str
+    needs_insert: bool
+    features: dict[str, float | int] | None
+    warning: str | None = None
+    error: str | None = None
 
 
 def get_table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -30,6 +48,12 @@ def get_table_columns(connection: sqlite3.Connection, table_name: str) -> set[st
 
 def current_timestamp() -> str:
     return datetime.utcnow().isoformat()
+
+
+def unusual_bpm_warning(file_path: str, bpm: float) -> str | None:
+    if bpm < UNUSUAL_BPM_MIN or bpm > UNUSUAL_BPM_MAX:
+        return f"Ongebruikelijke BPM voor {file_path}: {bpm:.2f}"
+    return None
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
@@ -137,8 +161,6 @@ def compute_features(file_path: str) -> dict[str, float | int]:
 
     tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
     bpm = extract_bpm(tempo)
-    if bpm < 60.0 or bpm > 220.0:
-        LOGGER.warning("Ongebruikelijke BPM voor %s: %.2f", file_path, bpm)
 
     chroma = librosa.feature.chroma_cqt(y=y, sr=sr)
     chroma_mean = chroma.mean(axis=1)
@@ -214,7 +236,6 @@ def insert_features(
         """,
         {"file_path": file_path, "updated_at": current_timestamp(), **features},
     )
-    connection.commit()
 
 
 def update_features(
@@ -240,12 +261,89 @@ def update_features(
         """,
         {"file_path": file_path, "updated_at": current_timestamp(), **features},
     )
-    connection.commit()
+
+
+def process_track(task: tuple[str, bool]) -> TrackProcessingResult:
+    file_path, needs_insert = task
+    try:
+        features = compute_features(file_path)
+        warning = unusual_bpm_warning(file_path, float(features["bpm"]))
+        return TrackProcessingResult(
+            file_path=file_path,
+            needs_insert=needs_insert,
+            features=features,
+            warning=warning,
+        )
+    except Exception as exc:  # noqa: BLE001
+        return TrackProcessingResult(
+            file_path=file_path,
+            needs_insert=needs_insert,
+            features=None,
+            error=str(exc),
+        )
+
+
+def resolve_worker_count(requested_workers: int | None, task_count: int) -> int:
+    if task_count <= 1:
+        return 1
+    if requested_workers is not None:
+        return max(1, min(requested_workers, task_count))
+    cpu_count = os.cpu_count() or 1
+    return max(1, min(cpu_count, task_count))
+
+
+def handle_result(connection: sqlite3.Connection, result: TrackProcessingResult) -> bool:
+    if result.error is not None:
+        LOGGER.error("Fout bij verwerken van %s: %s", result.file_path, result.error)
+        return False
+
+    if result.warning:
+        LOGGER.warning("%s", result.warning)
+
+    if result.features is None:
+        LOGGER.error("Geen features ontvangen voor %s.", result.file_path)
+        return False
+
+    if result.needs_insert:
+        insert_features(connection, result.file_path, result.features)
+        LOGGER.info("Features opgeslagen voor %s", result.file_path)
+    else:
+        update_features(connection, result.file_path, result.features)
+        LOGGER.info("Features bijgewerkt voor %s", result.file_path)
+    return True
+
+
+def iter_results_parallel(
+    tasks: list[tuple[str, bool]],
+    workers: int,
+):
+    with ProcessPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(process_track, task): task
+            for task in tasks
+        }
+        for future in as_completed(future_map):
+            file_path, needs_insert = future_map[future]
+            try:
+                yield future.result()
+            except Exception as exc:  # noqa: BLE001
+                yield TrackProcessingResult(
+                    file_path=file_path,
+                    needs_insert=needs_insert,
+                    features=None,
+                    error=str(exc),
+                )
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Bereken audio features voor tracks in SQLite.")
     parser.add_argument("--db-path", required=True, help="Pad naar de SQLite database.")
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="Aantal parallelle workers voor feature extraction. Standaard: aantal CPU-kernen.",
+    )
     return parser
 
 
@@ -259,18 +357,32 @@ def main() -> None:
 
     with sqlite3.connect(db_path) as connection:
         ensure_schema(connection)
+        tasks = pending_tracks(connection)
+        if not tasks:
+            LOGGER.info("Geen tracks gevonden die feature extraction nodig hebben.")
+            return
 
-        for file_path, needs_insert in pending_tracks(connection):
+        workers = resolve_worker_count(args.workers, len(tasks))
+        LOGGER.info("Start feature extraction voor %s tracks met %s worker(s).", len(tasks), workers)
+
+        processed_since_commit = 0
+        if workers == 1:
+            results = (process_track(task) for task in tasks)
+        else:
+            results = iter_results_parallel(tasks, workers)
+
+        for result in results:
             try:
-                features = compute_features(file_path)
-                if needs_insert:
-                    insert_features(connection, file_path, features)
-                    LOGGER.info("Features opgeslagen voor %s", file_path)
-                else:
-                    update_features(connection, file_path, features)
-                    LOGGER.info("Features bijgewerkt voor %s", file_path)
+                if handle_result(connection, result):
+                    processed_since_commit += 1
+                    if processed_since_commit >= COMMIT_INTERVAL:
+                        connection.commit()
+                        processed_since_commit = 0
             except Exception as exc:  # noqa: BLE001
-                LOGGER.error("Fout bij verwerken van %s: %s", file_path, exc)
+                LOGGER.error("Fout bij opslaan van %s: %s", result.file_path, exc)
+
+        if processed_since_commit:
+            connection.commit()
 
 
 if __name__ == "__main__":

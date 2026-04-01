@@ -1,6 +1,8 @@
 hdbscan==0.8.39
 librosa==0.10.2.post1
 mutagen==1.47.0
+numpy>=1.20.0
 PyQt6==6.7.1
 pyqtgraph==0.13.7
+scikit-learn>=1.0.0
 umap-learn==0.5.7

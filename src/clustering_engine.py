@@ -12,6 +12,35 @@ import numpy as np
 import umap
 
 try:
+    from domain_constants import (
+        BPM_PEAKTIME_MIN,
+        BPM_WARMUP_MAX,
+        CLUSTER_RECALC_THRESHOLD,
+        ENERGY_LOW_MAX,
+        ENERGY_MID_MAX,
+        HDBSCAN_MIN_CLUSTER_SIZE,
+        HDBSCAN_MIN_SAMPLES,
+        UMAP_MIN_DIST,
+        UMAP_N_COMPONENTS,
+        UMAP_N_NEIGHBORS,
+        UMAP_RANDOM_STATE,
+    )
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.domain_constants import (
+        BPM_PEAKTIME_MIN,
+        BPM_WARMUP_MAX,
+        CLUSTER_RECALC_THRESHOLD,
+        ENERGY_LOW_MAX,
+        ENERGY_MID_MAX,
+        HDBSCAN_MIN_CLUSTER_SIZE,
+        HDBSCAN_MIN_SAMPLES,
+        UMAP_MIN_DIST,
+        UMAP_N_COMPONENTS,
+        UMAP_N_NEIGHBORS,
+        UMAP_RANDOM_STATE,
+    )
+
+try:
     from database_init import (
         CREATE_CLUSTERS_TABLE,
         CREATE_CLUSTER_METADATA_TABLE,
@@ -26,7 +55,6 @@ except ModuleNotFoundError:  # pragma: no cover - import fallback for project-ro
 
 
 LOGGER = logging.getLogger("clustering_engine")
-RECALC_THRESHOLD = 0.10
 
 
 @dataclass(frozen=True)
@@ -147,21 +175,24 @@ def should_recalculate(connection: sqlite3.Connection, current_track_count: int)
         return True
 
     difference_ratio = abs(current_track_count - stored_count) / stored_count
-    return difference_ratio > RECALC_THRESHOLD
+    return difference_ratio > CLUSTER_RECALC_THRESHOLD
 
 
 def compute_umap(matrix: np.ndarray) -> np.ndarray:
     reducer = umap.UMAP(
-        n_components=2,
-        n_neighbors=15,
-        min_dist=0.1,
-        random_state=42,
+        n_components=UMAP_N_COMPONENTS,
+        n_neighbors=UMAP_N_NEIGHBORS,
+        min_dist=UMAP_MIN_DIST,
+        random_state=UMAP_RANDOM_STATE,
     )
     return reducer.fit_transform(matrix)
 
 
 def compute_labels(embedding: np.ndarray) -> list[int]:
-    clusterer = hdbscan.HDBSCAN(min_cluster_size=10, min_samples=5)
+    clusterer = hdbscan.HDBSCAN(
+        min_cluster_size=HDBSCAN_MIN_CLUSTER_SIZE,
+        min_samples=HDBSCAN_MIN_SAMPLES,
+    )
     clusterer.fit(embedding)
     return [int(label) for label in clusterer.labels_]
 
@@ -169,11 +200,11 @@ def compute_labels(embedding: np.ndarray) -> list[int]:
 def cluster_name(cluster_id: int, avg_bpm: float, avg_energy: float) -> str:
     if cluster_id == -1:
         return "Orphan"
-    if avg_energy > 0.75 and avg_bpm > 128:
+    if avg_energy > ENERGY_MID_MAX and avg_bpm > BPM_PEAKTIME_MIN:
         return "Peak-time"
-    if avg_energy < 0.4 and avg_bpm < 110:
+    if avg_energy < ENERGY_LOW_MAX and avg_bpm < BPM_WARMUP_MAX:
         return "Warm-up"
-    if avg_energy < 0.4 and avg_bpm > 110:
+    if avg_energy < ENERGY_LOW_MAX and avg_bpm > BPM_WARMUP_MAX:
         return "Late night"
     return f"Cluster {cluster_id}"
 
@@ -186,9 +217,9 @@ def most_common_genre(points: list[TrackPoint]) -> str:
 
 
 def cluster_description(avg_bpm: float, avg_energy: float, genre: str) -> str:
-    if avg_energy > 0.75:
+    if avg_energy > ENERGY_MID_MAX:
         energy_text = "hoge energie"
-    elif avg_energy < 0.4:
+    elif avg_energy < ENERGY_LOW_MAX:
         energy_text = "lage energie"
     else:
         energy_text = "gemiddelde energie"

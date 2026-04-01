@@ -80,19 +80,19 @@ from collection_analyser import (
     find_orphans,
     find_overcrowded_clusters,
     get_collection_stats,
-    set_database_path as set_collection_database_path,
 )
-from crate_generator import generate_crates, set_database_path as set_crate_database_path
+from crate_generator import generate_crates
 from feedback_engine import (
     apply_feedback,
     record_feedback,
-    set_database_path as set_feedback_database_path,
 )
-from recommendation_engine import (
-    get_next_tracks,
-    set_database_path as set_recommendation_database_path,
-)
+from recommendation_engine import get_next_tracks
 from set_generator import generate_set
+
+try:
+    from domain_constants import BPM_HISTOGRAM_BIN_SIZE, ENERGY_LOW_MAX, ENERGY_MID_MAX
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.domain_constants import BPM_HISTOGRAM_BIN_SIZE, ENERGY_LOW_MAX, ENERGY_MID_MAX
 
 
 BACKGROUND = "#0A0A0B"
@@ -584,11 +584,11 @@ class TrackFilterProxyModel(QSortFilterProxyModel):
             return False
 
         if self.energy_filter == "low":
-            return track.energy is not None and track.energy < 0.4
+            return track.energy is not None and track.energy < ENERGY_LOW_MAX
         if self.energy_filter == "mid":
-            return track.energy is not None and 0.4 <= track.energy <= 0.75
+            return track.energy is not None and ENERGY_LOW_MAX <= track.energy <= ENERGY_MID_MAX
         if self.energy_filter == "high":
-            return track.energy is not None and track.energy > 0.75
+            return track.energy is not None and track.energy > ENERGY_MID_MAX
 
         return True
 
@@ -701,7 +701,6 @@ class LibraryTab(PageBase):
 
         controls = QHBoxLayout()
         controls.setSpacing(12)
-        controls.addWidget(self.search, 1)
         controls.addWidget(self.bpm_filter)
         controls.addWidget(self.key_filter)
         controls.addWidget(self.energy_filter)
@@ -743,9 +742,12 @@ class LibraryTab(PageBase):
         bpm_values = [track.bpm for track in self.tracks if track.bpm is not None]
         if bpm_values:
             start = int(min(bpm_values) // 10 * 10)
-            stop = int(max(bpm_values) // 10 * 10 + 10)
-            for value in range(start, stop + 1, 10):
-                self.bpm_filter.addItem(f"{value}-{value + 9}", (value, value + 10))
+            stop = int(max(bpm_values) // BPM_HISTOGRAM_BIN_SIZE * BPM_HISTOGRAM_BIN_SIZE + BPM_HISTOGRAM_BIN_SIZE)
+            for value in range(start, stop + 1, BPM_HISTOGRAM_BIN_SIZE):
+                self.bpm_filter.addItem(
+                    f"{value}-{value + BPM_HISTOGRAM_BIN_SIZE - 1}",
+                    (value, value + BPM_HISTOGRAM_BIN_SIZE),
+                )
 
         self.key_filter.addItem("Alle keys", None)
         for key_value in range(12):
@@ -903,7 +905,7 @@ class TrackDetailTab(PageBase):
         self.cluster_label.setText(f"Cluster: {detail['cluster_name']}")
         self.energy_bar.set_value(float(detail["energy"] or 0.0))
 
-        suggestions = get_next_tracks(file_path, [], n=3)
+        suggestions = get_next_tracks(file_path, [], n=3, db_path=self.repository.database_path)
         for index, card in enumerate(self.suggestion_cards):
             suggestion = suggestions[index] if index < len(suggestions) else None
             card.set_suggestion(suggestion)
@@ -924,8 +926,13 @@ class TrackDetailTab(PageBase):
     def _handle_feedback(self, rating: int) -> None:
         if not self.current_file_path or not self.active_pair_file_path:
             return
-        record_feedback(self.current_file_path, self.active_pair_file_path, rating)
-        apply_feedback()
+        record_feedback(
+            self.current_file_path,
+            self.active_pair_file_path,
+            rating,
+            db_path=self.repository.database_path,
+        )
+        apply_feedback(db_path=self.repository.database_path)
         self.set_track(self.current_file_path)
 
     def _add_to_set(self) -> None:
@@ -936,8 +943,9 @@ class TrackDetailTab(PageBase):
 class SetBuilderTab(PageBase):
     track_selected = pyqtSignal(str)
 
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, database_path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.database_path = database_path
         self.set_tracks: list[str] = []
 
         self.trajectory_combo = QComboBox()
@@ -996,6 +1004,7 @@ class SetBuilderTab(PageBase):
         generated_tracks = generate_set(
             mapping[self.trajectory_combo.currentText()],
             int(self.length_spinbox.value()),
+            db_path=self.database_path,
         )
 
         self.set_tracks = []
@@ -1015,7 +1024,10 @@ class SetBuilderTab(PageBase):
             self.suggestion_card.set_suggestion(None)
             return
         current = self.set_tracks[-1]
-        suggestion = next(iter(get_next_tracks(current, list(self.set_tracks), n=1)), None)
+        suggestion = next(
+            iter(get_next_tracks(current, list(self.set_tracks), n=1, db_path=self.database_path)),
+            None,
+        )
         self.suggestion_card.set_suggestion(suggestion)
 
     def _handle_item_clicked(self, item: QListWidgetItem) -> None:
@@ -1049,8 +1061,10 @@ class CratesTab(PageBase):
         self.table.setColumnWidth(1, 120)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.verticalHeader().setDefaultSectionSize(44)
-        self.table.setItemDelegateForColumn(1, BpmDelegate(display_font, self.table))
-        self.table.setItemDelegateForColumn(2, EnergyDelegate(self.table))
+        self.bpm_delegate = BpmDelegate(display_font, self.table)
+        self.energy_delegate = EnergyDelegate(self.table)
+        self.table.setItemDelegateForColumn(1, self.bpm_delegate)
+        self.table.setItemDelegateForColumn(2, self.energy_delegate)
         self.table.clicked.connect(self._handle_click)
 
         split = QHBoxLayout()
@@ -1073,8 +1087,8 @@ class CratesTab(PageBase):
         tracks = self.repository.fetch_tracks_for_crate(item.text())
         self.model = build_track_model(tracks)
         self.table.setModel(self.model)
-        self.table.setItemDelegateForColumn(1, self.table.itemDelegateForColumn(1))
-        self.table.setItemDelegateForColumn(2, self.table.itemDelegateForColumn(2))
+        self.table.setItemDelegateForColumn(1, self.bpm_delegate)
+        self.table.setItemDelegateForColumn(2, self.energy_delegate)
 
     def _handle_click(self, index) -> None:
         file_path = index.data(FILE_PATH_ROLE)
@@ -1083,8 +1097,9 @@ class CratesTab(PageBase):
 
 
 class CollectionAnalysisTab(PageBase):
-    def __init__(self, parent: QWidget | None = None) -> None:
+    def __init__(self, database_path: Path, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.database_path = database_path
 
         self.analyze_button = QPushButton("Analyseer")
         self.analyze_button.clicked.connect(self.run_analysis)
@@ -1124,11 +1139,11 @@ class CollectionAnalysisTab(PageBase):
                 table.setItem(row_index, column_index, item)
 
     def run_analysis(self) -> None:
-        generate_crates()
-        orphans = find_orphans()
-        overcrowded = find_overcrowded_clusters()
-        missing_bridges = find_missing_bridges()
-        stats = get_collection_stats()
+        generate_crates(db_path=self.database_path)
+        orphans = find_orphans(db_path=self.database_path)
+        overcrowded = find_overcrowded_clusters(db_path=self.database_path)
+        missing_bridges = find_missing_bridges(db_path=self.database_path)
+        stats = get_collection_stats(db_path=self.database_path)
 
         crate_lines = [f"{name}: {value:.1f}%" for name, value in stats["crate_percentages"].items()]
         bpm_lines = [f"{bucket}: {count}" for bucket, count in stats["bpm_histogram"].items()]
@@ -1180,11 +1195,7 @@ class MainWindow(QMainWindow):
         self._fade_out: QPropertyAnimation | None = None
         self._fade_in: QPropertyAnimation | None = None
 
-        set_recommendation_database_path(database_path)
-        set_crate_database_path(database_path)
-        set_feedback_database_path(database_path)
-        set_collection_database_path(database_path)
-        generate_crates()
+        generate_crates(db_path=database_path)
 
         self.repository = LibraryRepository(database_path)
         self.tracks = self.repository.fetch_tracks()
@@ -1219,9 +1230,9 @@ class MainWindow(QMainWindow):
         self.library_tab = LibraryTab(self.tracks, display_font, body_font)
         self.cluster_tab = ClusterMapTab(self.cluster_points)
         self.detail_tab = TrackDetailTab(self.repository)
-        self.setbuilder_tab = SetBuilderTab()
+        self.setbuilder_tab = SetBuilderTab(database_path)
         self.crates_tab = CratesTab(self.repository, display_font, body_font)
-        self.collection_tab = CollectionAnalysisTab()
+        self.collection_tab = CollectionAnalysisTab(database_path)
 
         self.pages = [
             ("Bibliotheek", self.library_tab),

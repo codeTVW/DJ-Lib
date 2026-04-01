@@ -1,0 +1,54 @@
+# DJ Library Intelligence configuratie
+# Lokale overrides per gebruiker kunnen in ~/.djlibrary/config.toml gezet worden.
+
+[energy]
+low_max = 0.40
+mid_max = 0.75
+transition_max = 0.50
+warmup_max = 0.45
+peak_target = 0.85
+buildup_target = 0.62
+closing_target = 0.55
+club_warmup_target = 0.40
+afterhours_target = 0.35
+warmup_target = 0.30
+
+[bpm]
+warmup_max = 110.0
+club_warmup_max = 120.0
+buildup_min = 120.0
+buildup_max = 128.0
+peaktime_min = 128.0
+afterhours_max = 130.0
+warmup_trajectory_min = 100.0
+warmup_trajectory_max = 118.0
+target_club_warmup = 110.0
+target_buildup = 124.0
+target_peaktime = 132.0
+target_closing = 120.0
+target_afterhours = 125.0
+target_warmup = 109.0
+unusual_min = 60.0
+unusual_max = 220.0
+histogram_min = 60
+histogram_max = 220
+histogram_bin_size = 10
+
+[vocals]
+tools_min = 0.65
+
+[similarity]
+safe_min = 0.85
+safe_max_bpm_diff = 4.0
+creative_min = 0.65
+creative_max = 0.85
+creative_max_bpm_diff = 8.0
+
+[clustering]
+recalc_threshold = 0.10
+umap_n_components = 2
+umap_n_neighbors = 15
+umap_min_dist = 0.10
+umap_random_state = 42
+hdbscan_min_cluster_size = 10
+hdbscan_min_samples = 5

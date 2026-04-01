@@ -1,40 +1,70 @@
 from __future__ import annotations
 
-import json
 import logging
 import sqlite3
 from pathlib import Path
 from typing import Any
 
+try:
+    from db_utils import get_connection
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.db_utils import get_connection
+
+try:
+    from domain_constants import (
+        BPM_AFTERHOURS_MAX,
+        BPM_BUILDUP_MAX,
+        BPM_BUILDUP_MIN,
+        BPM_CLUB_WARMUP_MAX,
+        BPM_PEAKTIME_MIN,
+        BPM_TARGET_AFTERHOURS,
+        BPM_TARGET_BUILDUP,
+        BPM_TARGET_CLOSING,
+        BPM_TARGET_CLUB_WARMUP,
+        BPM_TARGET_PEAKTIME,
+        BPM_TARGET_WARMUP,
+        BPM_WARMUP_TRAJECTORY_MAX,
+        BPM_WARMUP_TRAJECTORY_MIN,
+        ENERGY_AFTERHOURS_TARGET,
+        ENERGY_BUILDUP_TARGET,
+        ENERGY_CLUB_WARMUP_TARGET,
+        ENERGY_CLOSING_TARGET,
+        ENERGY_LOW_MAX,
+        ENERGY_MID_MAX,
+        ENERGY_PEAK_TARGET,
+        ENERGY_TRANSITION_MAX,
+        ENERGY_WARMUP_MAX,
+        ENERGY_WARMUP_TARGET,
+    )
+except ModuleNotFoundError:  # pragma: no cover - import fallback for project-root imports
+    from src.domain_constants import (
+        BPM_AFTERHOURS_MAX,
+        BPM_BUILDUP_MAX,
+        BPM_BUILDUP_MIN,
+        BPM_CLUB_WARMUP_MAX,
+        BPM_PEAKTIME_MIN,
+        BPM_TARGET_AFTERHOURS,
+        BPM_TARGET_BUILDUP,
+        BPM_TARGET_CLOSING,
+        BPM_TARGET_CLUB_WARMUP,
+        BPM_TARGET_PEAKTIME,
+        BPM_TARGET_WARMUP,
+        BPM_WARMUP_TRAJECTORY_MAX,
+        BPM_WARMUP_TRAJECTORY_MIN,
+        ENERGY_AFTERHOURS_TARGET,
+        ENERGY_BUILDUP_TARGET,
+        ENERGY_CLUB_WARMUP_TARGET,
+        ENERGY_CLOSING_TARGET,
+        ENERGY_LOW_MAX,
+        ENERGY_MID_MAX,
+        ENERGY_PEAK_TARGET,
+        ENERGY_TRANSITION_MAX,
+        ENERGY_WARMUP_MAX,
+        ENERGY_WARMUP_TARGET,
+    )
+
 
 LOGGER = logging.getLogger("set_generator")
-DEFAULT_DB_PATH = Path(__file__).resolve().parent.parent / "data" / "db" / "dj_library.sqlite3"
-CONFIG_PATH = Path.home() / ".djlibrary" / "config.json"
-
-
-def _resolve_database_path() -> Path:
-    local_database = Path(__file__).resolve().with_name("database.db")
-    if local_database.exists():
-        return local_database
-
-    if CONFIG_PATH.exists():
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            configured = data.get("database_path")
-            if configured:
-                configured_path = Path(configured).expanduser()
-                if configured_path.exists():
-                    return configured_path
-        except (json.JSONDecodeError, OSError):
-            pass
-
-    return DEFAULT_DB_PATH
-
-
-def _get_connection() -> sqlite3.Connection:
-    connection = sqlite3.connect(_resolve_database_path())
-    connection.row_factory = sqlite3.Row
-    return connection
 
 
 def _load_similarity_map(connection: sqlite3.Connection) -> dict[tuple[str, str], float]:
@@ -61,33 +91,49 @@ def _club_phase_plan(length: int) -> list[dict[str, Any]]:
         {
             "name": "warm-up",
             "count": warmup_count,
-            "where_clause": "af.energy < 0.5 AND af.bpm < 120",
-            "target_bpm": 110.0,
-            "target_energy": 0.40,
+            "energy_max": ENERGY_TRANSITION_MAX,
+            "energy_max_inclusive": False,
+            "bpm_max": BPM_CLUB_WARMUP_MAX,
+            "bpm_max_inclusive": False,
+            "target_bpm": BPM_TARGET_CLUB_WARMUP,
+            "target_energy": ENERGY_CLUB_WARMUP_TARGET,
             "prefer_low_vocals": False,
         },
         {
             "name": "build-up",
             "count": buildup_count,
-            "where_clause": "af.energy >= 0.5 AND af.energy <= 0.75 AND af.bpm >= 120 AND af.bpm <= 128",
-            "target_bpm": 124.0,
-            "target_energy": 0.62,
+            "energy_min": ENERGY_TRANSITION_MAX,
+            "energy_min_inclusive": True,
+            "energy_max": ENERGY_MID_MAX,
+            "energy_max_inclusive": True,
+            "bpm_min": BPM_BUILDUP_MIN,
+            "bpm_min_inclusive": True,
+            "bpm_max": BPM_BUILDUP_MAX,
+            "bpm_max_inclusive": True,
+            "target_bpm": BPM_TARGET_BUILDUP,
+            "target_energy": ENERGY_BUILDUP_TARGET,
             "prefer_low_vocals": False,
         },
         {
             "name": "peak-time",
             "count": peaktime_count,
-            "where_clause": "af.energy > 0.75 AND af.bpm > 128",
-            "target_bpm": 132.0,
-            "target_energy": 0.85,
+            "energy_min": ENERGY_MID_MAX,
+            "energy_min_inclusive": False,
+            "bpm_min": BPM_PEAKTIME_MIN,
+            "bpm_min_inclusive": False,
+            "target_bpm": BPM_TARGET_PEAKTIME,
+            "target_energy": ENERGY_PEAK_TARGET,
             "prefer_low_vocals": False,
         },
         {
             "name": "closing",
             "count": closing_count,
-            "where_clause": "af.energy >= 0.4 AND af.energy <= 0.75",
-            "target_bpm": 120.0,
-            "target_energy": 0.55,
+            "energy_min": ENERGY_LOW_MAX,
+            "energy_min_inclusive": True,
+            "energy_max": ENERGY_MID_MAX,
+            "energy_max_inclusive": True,
+            "target_bpm": BPM_TARGET_CLOSING,
+            "target_energy": ENERGY_CLOSING_TARGET,
             "prefer_low_vocals": False,
         },
     ]
@@ -98,9 +144,14 @@ def _afterhours_phase_plan(length: int) -> list[dict[str, Any]]:
         {
             "name": "afterhours",
             "count": length,
-            "where_clause": "af.energy < 0.5 AND af.bpm >= 120 AND af.bpm <= 130",
-            "target_bpm": 125.0,
-            "target_energy": 0.35,
+            "energy_max": ENERGY_TRANSITION_MAX,
+            "energy_max_inclusive": False,
+            "bpm_min": BPM_BUILDUP_MIN,
+            "bpm_min_inclusive": True,
+            "bpm_max": BPM_AFTERHOURS_MAX,
+            "bpm_max_inclusive": True,
+            "target_bpm": BPM_TARGET_AFTERHOURS,
+            "target_energy": ENERGY_AFTERHOURS_TARGET,
             "prefer_low_vocals": True,
         }
     ]
@@ -111,9 +162,14 @@ def _warmup_phase_plan(length: int) -> list[dict[str, Any]]:
         {
             "name": "warmup",
             "count": length,
-            "where_clause": "af.energy < 0.45 AND af.bpm >= 100 AND af.bpm <= 118",
-            "target_bpm": 109.0,
-            "target_energy": 0.30,
+            "energy_max": ENERGY_WARMUP_MAX,
+            "energy_max_inclusive": False,
+            "bpm_min": BPM_WARMUP_TRAJECTORY_MIN,
+            "bpm_min_inclusive": True,
+            "bpm_max": BPM_WARMUP_TRAJECTORY_MAX,
+            "bpm_max_inclusive": True,
+            "target_bpm": BPM_TARGET_WARMUP,
+            "target_energy": ENERGY_WARMUP_TARGET,
             "prefer_low_vocals": False,
         }
     ]
@@ -129,7 +185,60 @@ def _phase_plan(trajectory: str, length: int) -> list[dict[str, Any]]:
     raise ValueError("Trajectory moet 'club', 'afterhours' of 'warmup' zijn.")
 
 
-def _query_phase_tracks(connection: sqlite3.Connection, where_clause: str) -> list[dict[str, Any]]:
+def _append_bound(
+    conditions: list[str],
+    parameters: list[float],
+    column: str,
+    value: float | None,
+    inclusive: bool,
+    lower_bound: bool,
+) -> None:
+    if value is None:
+        return
+    if lower_bound:
+        operator = ">=" if inclusive else ">"
+    else:
+        operator = "<=" if inclusive else "<"
+    conditions.append(f"{column} {operator} ?")
+    parameters.append(float(value))
+
+
+def _query_phase_tracks(connection: sqlite3.Connection, phase: dict[str, Any]) -> list[dict[str, Any]]:
+    conditions = ["af.bpm IS NOT NULL", "af.energy IS NOT NULL"]
+    parameters: list[float] = []
+    _append_bound(
+        conditions,
+        parameters,
+        "af.energy",
+        phase.get("energy_min"),
+        bool(phase.get("energy_min_inclusive", True)),
+        lower_bound=True,
+    )
+    _append_bound(
+        conditions,
+        parameters,
+        "af.energy",
+        phase.get("energy_max"),
+        bool(phase.get("energy_max_inclusive", True)),
+        lower_bound=False,
+    )
+    _append_bound(
+        conditions,
+        parameters,
+        "af.bpm",
+        phase.get("bpm_min"),
+        bool(phase.get("bpm_min_inclusive", True)),
+        lower_bound=True,
+    )
+    _append_bound(
+        conditions,
+        parameters,
+        "af.bpm",
+        phase.get("bpm_max"),
+        bool(phase.get("bpm_max_inclusive", True)),
+        lower_bound=False,
+    )
+
     rows = connection.execute(
         f"""
         SELECT
@@ -142,9 +251,10 @@ def _query_phase_tracks(connection: sqlite3.Connection, where_clause: str) -> li
         FROM audio_features AS af
         JOIN tracks AS t
             ON t.file_path = af.file_path
-        WHERE {where_clause}
+        WHERE {" AND ".join(conditions)}
         ORDER BY t.artist COLLATE NOCASE, t.title COLLATE NOCASE
-        """
+        """,
+        parameters,
     ).fetchall()
     return [dict(row) for row in rows]
 
@@ -267,13 +377,17 @@ def _append_track(
     )
 
 
-def generate_set(trajectory: str, length: int) -> list[dict[str, Any]]:
+def generate_set(
+    trajectory: str,
+    length: int,
+    db_path: str | Path | None = None,
+) -> list[dict[str, Any]]:
     if trajectory not in {"club", "afterhours", "warmup"}:
         raise ValueError("Trajectory moet 'club', 'afterhours' of 'warmup' zijn.")
     if length <= 0:
         return []
 
-    with _get_connection() as connection:
+    with get_connection(db_path) as connection:
         similarity_map = _load_similarity_map(connection)
         all_tracks = _query_all_tracks(connection)
         phase_plan = _phase_plan(trajectory, length)
@@ -282,7 +396,7 @@ def generate_set(trajectory: str, length: int) -> list[dict[str, Any]]:
         selected_paths: set[str] = set()
 
         for phase in phase_plan:
-            phase_tracks = _query_phase_tracks(connection, str(phase["where_clause"]))
+            phase_tracks = _query_phase_tracks(connection, phase)
             previous_track = selected_tracks[-1] if selected_tracks else None
 
             for _ in range(int(phase["count"])):
